@@ -14,11 +14,11 @@ logger = logging.getLogger(__name__)
 # Connect to your MongoDB instance
 client = pymongo.MongoClient("mongodb://localhost:27017")
 db = client['codeforces_optimized']  # replace with your DB name
-
+db1 = client['codeforces_db']  # replace with your DB name
 # Fetch data from MongoDB collections
-submissions_raw = list(db.submissions.find())
+submissions_raw = list(db1.submissions.find())
 problems_raw    = list(db.problems.find())
-ratings_raw     = list(db.ratings.find())
+ratings_raw     = list(db1.ratings.find())
 users_raw       = list(db.users.find())
 
 start_total = time.time()
@@ -175,21 +175,54 @@ start_step3 = time.time()
 # - **Submission Count in a Recent Time Window:** For example, number of submissions in the last month.
 # - **Problem Difficulty Offset:** For example, if the user's rating is much higher/lower than the problem rating.
 # - **User Demographics:** Such as country or organization (if they might influence performance).
-#
-# Here’s an example for “time since last submission”:
-def time_since_last_submission(user_handle, current_time):
-    user_subs = [s for s in submissions_raw 
-                 if s.get('user_handle') == user_handle 
-                 and s.get('creationTimeSeconds') < current_time]
-    if user_subs:
-        last_sub_time = max(s.get('creationTimeSeconds') for s in user_subs)
-        return current_time - last_sub_time
-    return None
+# Precompute sorted submission times per user
+user_sub_times = defaultdict(list)
+for s in submissions_raw:
+    user = s.get('user_handle')
+    sub_time = s.get('creationTimeSeconds')
+    user_sub_times[user].append(sub_time)
+for user in user_sub_times:
+    user_sub_times[user].sort()
+
+# Optimized version of time_since_last_submission using binary search
+def time_since_last_submission_opt(user_handle, current_time):
+    times = user_sub_times.get(user_handle)
+    if not times:
+        return None
+    idx = bisect.bisect_left(times, current_time)
+    if idx == 0:
+        return None  # no submission before current_time
+    last_time = times[idx - 1]
+    return current_time - last_time
 
 df_sub['time_since_last_sub'] = df_sub.apply(
-    lambda row: time_since_last_submission(row['user_handle'], row['submission_time']),
+    lambda row: time_since_last_submission_opt(row['user_handle'], row['submission_time']),
     axis=1
 )
+
+# New Feature: Recent Submission Count (e.g., submissions in the last 30 days)
+def recent_submission_count_opt(user_handle, current_time, window=30*24*3600):
+    times = user_sub_times.get(user_handle)
+    if not times:
+        return 0
+    lower_bound = current_time - window
+    left_idx = bisect.bisect_left(times, lower_bound)
+    right_idx = bisect.bisect_left(times, current_time)
+    return right_idx - left_idx
+
+df_sub['recent_sub_count'] = df_sub.apply(
+    lambda row: recent_submission_count_opt(row['user_handle'], row['submission_time']),
+    axis=1
+)
+
+# New Feature: Absolute Problem Difficulty Offset
+df_sub['abs_difficulty_offset'] = df_sub['rating_diff'].apply(lambda rd: abs(rd) if rd is not None else None)
+
+# New Feature: User Demographics (e.g., country)
+# Extract relevant demographics from df_users; assuming column 'country' exists and user's handle is in 'handle'
+df_users_small = df_users[['handle', 'country']]  # adjust if more demographics are available
+df_sub = df_sub.merge(df_users_small, left_on='user_handle', right_on='handle', how='left')
+df_sub = df_sub.rename(columns={'country': 'user_country'}).drop(columns=['handle'])
 
 print(f"Step 3 completed in {time.time() - start_step3:.2f} seconds")
 
@@ -210,13 +243,16 @@ feature_columns = [
     'user_total_submissions',
     'avg_tag_success_rate',
     'time_since_last_sub',
+    'recent_sub_count',
+    'abs_difficulty_offset',
+    # 'user_country',
     'solved'  # This is the label.
 ]
 
 df_features = df_sub[feature_columns]
 
 # Save the DataFrame to a CSV file.
-df_features.to_csv("codeforces_feature_dataset.csv", index=False)
+df_features.to_csv("codeforces_feature_dataset_v1.1.csv", index=False)
 
 print("CSV file with engineered features saved as codeforces_feature_dataset.csv")
 print(f"Step 4 completed in {time.time() - start_step4:.2f} seconds")
